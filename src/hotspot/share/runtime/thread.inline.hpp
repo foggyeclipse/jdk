@@ -85,7 +85,7 @@ inline WXMode Thread::enable_wx(WXMode new_state) {
   WXMode old = _wx_state;
   if (_wx_state != new_state) {
     _wx_state = new_state;
-    os::current_thread_enable_wx(new_state);
+//    os::current_thread_enable_wx(new_state);
   }
   return old;
 }

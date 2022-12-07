@@ -207,15 +207,48 @@ bool PosixSignals::pd_hotspot_signal_handler(int sig, siginfo_t* info,
   // Enable WXWrite: this function is called by the signal handler at arbitrary
   // point of execution.
   ThreadWXEnable wx(WXWrite, thread);
+//  os::current_thread_enable_wx(WXWrite);
+
+//    #if defined(__APPLE__)
+//        if (sig == SIGBUS)
+//        {
+//             os::current_thread_enable_wx(WXWrite);
+//             //return true;
+//             //return false;
+//        }
+//    #endif
+
+//  bool switched = false;
+//  if (sig == SIGBUS)
+//  {
+//    os::current_thread_enable_wx(WXWrite);
+//    switched true;
+//  }
 
   // decide if this trap can be handled by a stub
   address stub = NULL;
 
   address pc          = NULL;
+//    #if defined(__APPLE__)
+//        if (sig == SIGBUS)
+//        {
+//             os::current_thread_enable_wx(WXWrite);
+//             //return true;
+//             //return false;
+//        }
+//    #endif
 
   //%note os_trap_1
   if (info != NULL && uc != NULL && thread != NULL) {
     pc = (address) os::Posix::ucontext_get_pc(uc);
+//      #if defined(__APPLE__)
+//          if (sig == SIGBUS)
+//          {
+//               os::current_thread_enable_wx(WXWrite);
+//               //return true;
+//               //return false;
+//          }
+//      #endif
 
     // Handle ALL stack overflow variations here
     if (sig == SIGSEGV || sig == SIGBUS) {
@@ -230,6 +263,10 @@ bool PosixSignals::pd_hotspot_signal_handler(int sig, siginfo_t* info,
       if (thread->is_in_full_stack(addr)) {
         // stack overflow
         if (os::Posix::handle_stack_overflow(thread, addr, pc, uc, &stub)) {
+//        if (switched)
+//        {
+//            os::current_thread_enable_wx(WXWrite);
+//        }
           return true; // continue
         }
       }
@@ -261,6 +298,9 @@ bool PosixSignals::pd_hotspot_signal_handler(int sig, siginfo_t* info,
       } else if (sig == SIGBUS && !MacroAssembler::uses_implicit_null_check(info->si_addr)) {
 #else
       } else if (sig == SIGBUS /* && info->si_code == BUS_OBJERR */) {
+//      os::current_thread_enable_wx(WXWrite);
+//         return true;
+//         return false;
 #endif
         // BugId 4454115: A read from a MappedByteBuffer can fault
         // here if the underlying file has been truncated.
@@ -330,8 +370,16 @@ bool PosixSignals::pd_hotspot_signal_handler(int sig, siginfo_t* info,
     if (thread != NULL) thread->set_saved_exception_pc(pc);
 
     os::Posix::ucontext_set_pc(uc, stub);
+//    if (switched)
+//    {
+//        os::current_thread_enable_wx(WXWrite);
+//    }
     return true;
   }
+//  if (switched)
+//  {
+//    os::current_thread_enable_wx(WXWrite);
+//  }
 
   return false; // Mute compiler
 }
