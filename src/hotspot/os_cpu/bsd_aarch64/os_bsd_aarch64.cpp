@@ -253,7 +253,14 @@ bool PosixSignals::pd_hotspot_signal_handler(int sig, siginfo_t* info,
     // Handle ALL stack overflow variations here
     if (sig == SIGSEGV || sig == SIGBUS) {
       address addr = (address) info->si_addr;
-
+      //      #if defined(__APPLE__)
+      //          if (sig == SIGBUS)
+      //          {
+      //               os::current_thread_enable_wx(WXWrite);
+      //               //return true;
+      //               //return false;
+      //          }
+      //      #endif
       // Make sure the high order byte is sign extended, as it may be masked away by the hardware.
       if ((uintptr_t(addr) & (uintptr_t(1) << 55)) != 0) {
         addr = address(uintptr_t(addr) | (uintptr_t(0xFF) << 56));
@@ -299,8 +306,8 @@ bool PosixSignals::pd_hotspot_signal_handler(int sig, siginfo_t* info,
 #else
       } else if (sig == SIGBUS /* && info->si_code == BUS_OBJERR */) {
 //      os::current_thread_enable_wx(WXWrite);
-//         return true;
-//         return false;
+//      //return true;
+//      //return false;
 #endif
         // BugId 4454115: A read from a MappedByteBuffer can fault
         // here if the underlying file has been truncated.
