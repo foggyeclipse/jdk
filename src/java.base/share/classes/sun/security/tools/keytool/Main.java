@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1997, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1997, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -1836,6 +1836,11 @@ public final class Main {
             if (!"PBE".equalsIgnoreCase(keyAlgName)) {
                 useDefaultPBEAlgorithm = false;
             }
+
+            SecretKeyConstraintsParameters skcp =
+                    new SecretKeyConstraintsParameters(secKey);
+            checkWeakConstraint(rb.getString("the.generated.secretkey"),
+                    keyAlgName, skcp);
 
             if (verbose) {
                 MessageFormat form = new MessageFormat(rb.getString(
@@ -5068,6 +5073,16 @@ public final class Main {
         }
     }
 
+    private void checkWeakConstraint(String label, String keyAlg,
+            SecretKeyConstraintsParameters skcp) {
+        try {
+            LEGACY_CHECK.permits(keyAlg, skcp, false);
+        } catch (CertPathValidatorException e) {
+            weakWarnings.add(String.format(
+                    rb.getString("key.algorithm.weak"), label, keyAlg));
+        }
+    }
+
     private void checkWeak(String label, CRL crl, Key key) {
         if (crl instanceof X509CRLImpl impl) {
             checkWeak(label, impl.getSigAlgName(), key);
@@ -5300,13 +5315,15 @@ class Pair<A, B> {
         return "Pair[" + fst + "," + snd + "]";
     }
 
-    public boolean equals(Object other) {
+    @Override
+    public boolean equals(Object obj) {
         return
-            other instanceof Pair &&
-            Objects.equals(fst, ((Pair)other).fst) &&
-            Objects.equals(snd, ((Pair)other).snd);
+            obj instanceof Pair<?, ?> other &&
+            Objects.equals(fst, other.fst) &&
+            Objects.equals(snd, other.snd);
     }
 
+    @Override
     public int hashCode() {
         if (fst == null) return (snd == null) ? 0 : snd.hashCode() + 1;
         else if (snd == null) return fst.hashCode() + 2;

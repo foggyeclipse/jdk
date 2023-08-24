@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1997, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1997, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -30,6 +30,7 @@
 #include "oops/oopsHierarchy.hpp"
 #include "runtime/basicLock.hpp"
 #include "runtime/monitorChunk.hpp"
+#include "utilities/checkedCast.hpp"
 #include "utilities/growableArray.hpp"
 #include "utilities/macros.hpp"
 #ifdef ZERO
@@ -147,7 +148,7 @@ class frame {
   // inline void set_cb(CodeBlob* cb);
 
   const ImmutableOopMap* oop_map() const {
-    if (_oop_map == NULL) {
+    if (_oop_map == nullptr) {
       _oop_map = get_oop_map();
     }
     return _oop_map;
@@ -159,10 +160,10 @@ class frame {
   // Every frame needs to return a unique id which distinguishes it from all other frames.
   // For sparc and ia32 use sp. ia64 can have memory frames that are empty so multiple frames
   // will have identical sp values. For ia64 the bsp (fp) value will serve. No real frame
-  // should have an id() of NULL so it is a distinguishing value for an unmatchable frame.
+  // should have an id() of null so it is a distinguishing value for an unmatchable frame.
   // We also have relationals which allow comparing a frame to anoth frame's id() allow
   // us to distinguish younger (more recent activation) from older (less recent activations)
-  // A NULL id is only valid when comparing for equality.
+  // A null id is only valid when comparing for equality.
 
   intptr_t* id(void) const;
   bool is_younger(intptr_t* id) const;
@@ -175,7 +176,7 @@ class frame {
   bool equal(frame other) const;
 
   // type testers
-  bool is_empty()                const { return _pc == NULL; }
+  bool is_empty()                const { return _pc == nullptr; }
   bool is_interpreted_frame()    const;
   bool is_java_frame()           const;
   bool is_entry_frame()          const;             // Java frame called from C?
@@ -236,6 +237,8 @@ class frame {
 
   bool is_entry_frame_valid(JavaThread* thread) const;
 
+  Method* safe_interpreter_frame_method() const;
+
   // All frames:
 
   // A low-level interface for vframes:
@@ -246,6 +249,12 @@ class frame {
   intptr_t  at_absolute(int index) const         { return *addr_at(index); }
   // Interpreter frames in continuation stacks are on the heap, and internal addresses are relative to fp.
   intptr_t  at_relative(int index) const         { return (intptr_t)(fp() + fp()[index]); }
+
+  intptr_t  at_relative_or_null(int index) const {
+    return (fp()[index] != 0)
+      ? (intptr_t)(fp() + fp()[index])
+      : 0;
+  }
 
   intptr_t at(int index) const                   {
     return _on_heap ? at_relative(index) : at_absolute(index);
@@ -293,9 +302,9 @@ class frame {
   // Interpreter frames:
 
  private:
-  intptr_t** interpreter_frame_locals_addr() const;
-  intptr_t*  interpreter_frame_bcp_addr() const;
-  intptr_t*  interpreter_frame_mdp_addr() const;
+  intptr_t* interpreter_frame_locals() const;
+  intptr_t* interpreter_frame_bcp_addr() const;
+  intptr_t* interpreter_frame_mdp_addr() const;
 
  public:
   // Locals
@@ -415,7 +424,7 @@ class frame {
   void describe_pd(FrameValues& values, int frame_no);
 
  public:
-  void print_value() const { print_value_on(tty,NULL); }
+  void print_value() const { print_value_on(tty,nullptr); }
   void print_value_on(outputStream* st, JavaThread *thread) const;
   void print_on(outputStream* st) const;
   void interpreter_frame_print_on(outputStream* st) const;
@@ -423,7 +432,7 @@ class frame {
   static void print_C_frame(outputStream* st, char* buf, int buflen, address pc);
 
   // Add annotated descriptions of memory locations belonging to this frame to values
-  void describe(FrameValues& values, int frame_no, const RegisterMap* reg_map=NULL);
+  void describe(FrameValues& values, int frame_no, const RegisterMap* reg_map=nullptr);
 
   // Conversion from a VMReg to physical stack location
   template <typename RegisterMapT>
@@ -457,7 +466,7 @@ class frame {
 #else
     DerivedPointerIterationMode dpim = DerivedPointerIterationMode::_ignore;;
 #endif
-    oops_do_internal(f, cf, NULL, dpim, map, true);
+    oops_do_internal(f, cf, nullptr, dpim, map, true);
   }
 
   void oops_do(OopClosure* f, CodeBlobClosure* cf, DerivedOopClosure* df, const RegisterMap* map) {
@@ -466,7 +475,7 @@ class frame {
 
   void oops_do(OopClosure* f, CodeBlobClosure* cf, const RegisterMap* map,
                DerivedPointerIterationMode derived_mode) const {
-    oops_do_internal(f, cf, NULL, derived_mode, map, true);
+    oops_do_internal(f, cf, nullptr, derived_mode, map, true);
   }
 
   void nmethods_do(CodeBlobClosure* cf) const;
@@ -494,8 +503,8 @@ class FrameValue {
   int priority;
 
   FrameValue() {
-    location = NULL;
-    description = NULL;
+    location = nullptr;
+    description = nullptr;
     owner = -1;
     priority = 0;
   }
@@ -514,11 +523,10 @@ class FrameValues {
     if (a->location == b->location) {
       return a->priority - b->priority;
     }
-    return a->location - b->location;
+    return checked_cast<int>(a->location - b->location);
   }
 
-  void print_on(outputStream* out, int min_index, int max_index, intptr_t* v0, intptr_t* v1,
-                bool on_heap = false);
+  void print_on(outputStream* out, int min_index, int max_index, intptr_t* v0, intptr_t* v1);
 
  public:
   // Used by frame functions to describe locations.

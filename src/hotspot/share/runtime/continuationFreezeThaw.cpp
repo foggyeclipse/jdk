@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -38,7 +38,6 @@
 #include "jfr/jfrEvents.hpp"
 #include "logging/log.hpp"
 #include "logging/logStream.hpp"
-#include "metaprogramming/conditional.hpp"
 #include "oops/access.inline.hpp"
 #include "oops/method.inline.hpp"
 #include "oops/oopsHierarchy.hpp"
@@ -67,6 +66,11 @@
 #include "utilities/debug.hpp"
 #include "utilities/exceptions.hpp"
 #include "utilities/macros.hpp"
+#if INCLUDE_ZGC
+#include "gc/z/zStackChunkGCData.inline.hpp"
+#endif
+
+#include <type_traits>
 
 /*
  * This file contains the implementation of continuation freezing (yield) and thawing (run).
@@ -244,6 +248,8 @@ static JRT_LEAF(intptr_t*, thaw(JavaThread* thread, int kind))
   // JRT_ENTRY instead?
   ResetNoHandleMark rnhm;
 
+  // we might modify the code cache via BarrierSetNMethod::nmethod_entry_barrier
+  MACOS_AARCH64_ONLY(ThreadWXEnable __wx(WXWrite, thread));
   return ConfigT::thaw(thread, (Continuation::thaw_kind)kind);
 JRT_END
 
@@ -260,7 +266,7 @@ template <oop_kind oops, typename BarrierSetT>
 class Config {
 public:
   typedef Config<oops, BarrierSetT> SelfT;
-  typedef typename Conditional<oops == oop_kind::NARROW, narrowOop, oop>::type OopT;
+  using OopT = std::conditional_t<oops == oop_kind::NARROW, narrowOop, oop>;
 
   static int freeze(JavaThread* thread, intptr_t* const sp) {
     return freeze_internal<SelfT>(thread, sp);
@@ -271,10 +277,10 @@ public:
   }
 };
 
-static bool stack_overflow_check(JavaThread* thread, int size, address sp) {
-  const int page_size = os::vm_page_size();
+static bool stack_overflow_check(JavaThread* thread, size_t size, address sp) {
+  const size_t page_size = os::vm_page_size();
   if (size > page_size) {
-    if (sp - size < thread->stack_overflow_state()->stack_overflow_limit()) {
+    if (sp - size < thread->stack_overflow_state()->shadow_zone_safe_limit()) {
       return false;
     }
   }
@@ -398,7 +404,7 @@ protected:
   // slow path
   virtual stackChunkOop allocate_chunk_slow(size_t stack_size) = 0;
 
-  int cont_size() { return _cont_stack_bottom - _cont_stack_top; }
+  int cont_size() { return pointer_delta_as_int(_cont_stack_bottom, _cont_stack_top); }
 
 private:
   // slow path
@@ -483,8 +489,11 @@ FreezeBase::FreezeBase(JavaThread* thread, ContinuationWrapper& cont, intptr_t* 
 
   assert(_cont.chunk_invariant(), "");
   assert(!Interpreter::contains(_cont.entryPC()), "");
-  static const int doYield_stub_frame_size = NOT_PPC64(frame::metadata_words)
-                                             PPC64_ONLY(frame::abi_reg_args_size >> LogBytesPerWord);
+#if !defined(PPC64) || defined(ZERO)
+  static const int doYield_stub_frame_size = frame::metadata_words;
+#else
+  static const int doYield_stub_frame_size = frame::native_abi_reg_args_size >> LogBytesPerWord;
+#endif
   assert(SharedRuntime::cont_doYield_stub()->frame_size() == doYield_stub_frame_size, "");
 
   // properties of the continuation on the stack; all sizes are in words
@@ -1054,12 +1063,8 @@ NOINLINE freeze_result FreezeBase::recurse_freeze_interpreted_frame(frame& f, fr
 
   // The frame's top never includes the stack arguments to the callee
   intptr_t* const stack_frame_top = ContinuationHelper::InterpretedFrame::frame_top(f, callee_argsize, callee_interpreted);
-  intptr_t* const callers_sp      = ContinuationHelper::InterpretedFrame::callers_sp(f);
-  const int locals = f.interpreter_frame_method()->max_locals();
-  const int fsize = callers_sp + frame::metadata_words_at_top + locals - stack_frame_top;
-
   intptr_t* const stack_frame_bottom = ContinuationHelper::InterpretedFrame::frame_bottom(f);
-  assert(stack_frame_bottom - stack_frame_top >= fsize, ""); // == on x86
+  const int fsize = pointer_delta_as_int(stack_frame_bottom, stack_frame_top);
 
   DEBUG_ONLY(verify_frame_top(f, stack_frame_top));
 
@@ -1089,9 +1094,9 @@ NOINLINE freeze_result FreezeBase::recurse_freeze_interpreted_frame(frame& f, fr
   intptr_t* heap_frame_bottom = ContinuationHelper::InterpretedFrame::frame_bottom(hf);
   assert(heap_frame_bottom == heap_frame_top + fsize, "");
 
-  // on AArch64 we add padding between the locals and the rest of the frame to keep the fp 16-byte-aligned
-  copy_to_chunk(stack_frame_bottom - locals, heap_frame_bottom - locals, locals); // copy locals
-  copy_to_chunk(stack_frame_top, heap_frame_top, fsize - locals);                 // copy rest
+  // Some architectures (like AArch64/PPC64/RISC-V) add padding between the locals and the fixed_frame to keep the fp 16-byte-aligned.
+  // On those architectures we freeze the padding in order to keep the same fp-relative offsets in the fixed_frame.
+  copy_to_chunk(stack_frame_top, heap_frame_top, fsize);
   assert(!is_bottom_frame || !caller.is_interpreted_frame() || (heap_frame_top + fsize) == (caller.unextended_sp() + argsize), "");
 
   relativize_interpreted_frame_metadata(f, hf);
@@ -1118,7 +1123,7 @@ freeze_result FreezeBase::recurse_freeze_compiled_frame(frame& f, frame& caller,
   intptr_t* const stack_frame_bottom = ContinuationHelper::CompiledFrame::frame_bottom(f);
   // including metadata between f and its stackargs
   const int argsize = ContinuationHelper::CompiledFrame::stack_argsize(f) + frame::metadata_words_at_top;
-  const int fsize = stack_frame_bottom + argsize - stack_frame_top;
+  const int fsize = pointer_delta_as_int(stack_frame_bottom + argsize, stack_frame_top);
 
   log_develop_trace(continuations)("recurse_freeze_compiled_frame %s _size: %d fsize: %d argsize: %d",
                              ContinuationHelper::Frame::frame_method(f) != nullptr ?
@@ -1256,7 +1261,7 @@ NOINLINE void FreezeBase::finish_freeze(const frame& f, const frame& top) {
 inline bool FreezeBase::stack_overflow() { // detect stack overflow in recursive native code
   JavaThread* t = !_preempt ? _thread : JavaThread::current();
   assert(t == JavaThread::current(), "");
-  if (os::current_stack_pointer() < t->stack_overflow_state()->stack_overflow_limit()) {
+  if (os::current_stack_pointer() < t->stack_overflow_state()->shadow_zone_safe_limit()) {
     if (!_preempt) {
       ContinuationWrapper::SafepointOp so(t, _cont); // could also call _cont.done() instead
       Exceptions::_throw_msg(t, __FILE__, __LINE__, vmSymbols::java_lang_StackOverflowError(), "Stack overflow while freezing");
@@ -1390,14 +1395,16 @@ stackChunkOop Freeze<ConfigT>::allocate_chunk(size_t stack_size) {
   chunk->set_cont_access<IS_DEST_UNINITIALIZED>(_cont.continuation());
 
 #if INCLUDE_ZGC
- if (UseZGC) {
+  if (UseZGC) {
+    if (ZGenerational) {
+      ZStackChunkGCData::initialize(chunk);
+    }
     assert(!chunk->requires_barriers(), "ZGC always allocates in the young generation");
     _barriers = false;
   } else
 #endif
 #if INCLUDE_SHENANDOAHGC
-if (UseShenandoahGC) {
-
+  if (UseShenandoahGC) {
     _barriers = chunk->requires_barriers();
   } else
 #endif
@@ -1461,7 +1468,7 @@ static bool monitors_on_stack(JavaThread* thread) {
   ContinuationEntry* ce = thread->last_continuation();
   RegisterMap map(thread,
                   RegisterMap::UpdateMap::include,
-                  RegisterMap::ProcessFrames::skip,
+                  RegisterMap::ProcessFrames::include,
                   RegisterMap::WalkContinuation::skip);
   map.set_include_argument_oops(false);
   for (frame f = thread->last_frame(); Continuation::is_frame_in_continuation(ce, f); f = f.sender(&map)) {
@@ -1620,7 +1627,7 @@ static freeze_result is_pinned0(JavaThread* thread, oop cont_scope, bool safepoi
       if (scope == cont_scope) {
         break;
       }
-      int monitor_count = entry->parent_held_monitor_count();
+      intx monitor_count = entry->parent_held_monitor_count();
       entry = entry->parent();
       if (entry == nullptr) {
         break;
@@ -1750,7 +1757,6 @@ private:
   void maybe_set_fastpath(intptr_t* sp) { if (sp > _fastpath) _fastpath = sp; }
 
   static inline void derelativize_interpreted_frame_metadata(const frame& hf, const frame& f);
-  static inline void set_interpreter_frame_bottom(const frame& f, intptr_t* bottom);
 
  public:
   CONT_JFR_ONLY(FreezeThawJfrInfo& jfr_info() { return _jfr_info; })
@@ -1902,7 +1908,7 @@ NOINLINE intptr_t* Thaw<ConfigT>::thaw_fast(stackChunkOop chunk) {
   }
 
   // Are we thawing the last frame(s) in the continuation
-  const bool is_last = empty && chunk->parent() == NULL;
+  const bool is_last = empty && chunk->parent() == nullptr;
   assert(!is_last || argsize == 0, "");
 
   log_develop_trace(continuations)("thaw_fast partial: %d is_last: %d empty: %d size: %d argsize: %d entrySP: " PTR_FORMAT,
@@ -2062,7 +2068,7 @@ void ThawBase::finalize_thaw(frame& entry, int argsize) {
   }
   assert(_stream.is_done() == chunk->is_empty(), "");
 
-  int total_thawed = _stream.unextended_sp() - _top_unextended_sp_before_thaw;
+  int total_thawed = pointer_delta_as_int(_stream.unextended_sp(), _top_unextended_sp_before_thaw);
   chunk->set_max_thawing_size(chunk->max_thawing_size() - total_thawed);
 
   _cont.set_argsize(argsize);
@@ -2146,20 +2152,18 @@ NOINLINE void ThawBase::recurse_thaw_interpreted_frame(const frame& hf, frame& c
   intptr_t* const heap_frame_bottom = ContinuationHelper::InterpretedFrame::frame_bottom(hf);
 
   assert(hf.is_heap_frame(), "should be");
-  const int fsize = heap_frame_bottom - heap_frame_top;
-
-  assert((stack_frame_bottom >= stack_frame_top + fsize) &&
-         (stack_frame_bottom <= stack_frame_top + fsize + 1), ""); // internal alignment on aarch64
-
-  // on AArch64/PPC64 we add padding between the locals and the rest of the frame to keep the fp 16-byte-aligned
-  const int locals = hf.interpreter_frame_method()->max_locals();
-  assert(hf.is_heap_frame(), "should be");
   assert(!f.is_heap_frame(), "should not be");
 
-  copy_from_chunk(heap_frame_bottom - locals, stack_frame_bottom - locals, locals); // copy locals
-  copy_from_chunk(heap_frame_top, stack_frame_top, fsize - locals);                 // copy rest
+  const int fsize = pointer_delta_as_int(heap_frame_bottom, heap_frame_top);
+  assert((stack_frame_bottom == stack_frame_top + fsize), "");
 
-  set_interpreter_frame_bottom(f, stack_frame_bottom); // the copy overwrites the metadata
+  // Some architectures (like AArch64/PPC64/RISC-V) add padding between the locals and the fixed_frame to keep the fp 16-byte-aligned.
+  // On those architectures we freeze the padding in order to keep the same fp-relative offsets in the fixed_frame.
+  copy_from_chunk(heap_frame_top, stack_frame_top, fsize);
+
+  // Make sure the relativized locals is already set.
+  assert(f.interpreter_frame_local_at(0) == stack_frame_bottom - 1, "invalid frame bottom");
+
   derelativize_interpreted_frame_metadata(hf, f);
   patch(f, caller, is_bottom_frame);
 
@@ -2169,6 +2173,8 @@ NOINLINE void ThawBase::recurse_thaw_interpreted_frame(const frame& hf, frame& c
   CONT_JFR_ONLY(_jfr_info.record_interpreted_frame();)
 
   maybe_set_fastpath(f.sp());
+
+  const int locals = hf.interpreter_frame_method()->max_locals();
 
   if (!is_bottom_frame) {
     // can only fix caller once this frame is thawed (due to callee saved regs)
@@ -2563,7 +2569,7 @@ static void print_frame_layout(const frame& f, bool callee_complete, outputStrea
   FrameValues values;
   assert(f.get_cb() != nullptr, "");
   RegisterMap map(f.is_heap_frame() ?
-                    (JavaThread*)nullptr :
+                    nullptr :
                     JavaThread::current(),
                   RegisterMap::UpdateMap::include,
                   RegisterMap::ProcessFrames::skip,
@@ -2574,7 +2580,7 @@ static void print_frame_layout(const frame& f, bool callee_complete, outputStrea
     frame::update_map_with_saved_link(&map, ContinuationHelper::Frame::callee_link_address(f));
   }
   const_cast<frame&>(f).describe(values, 0, &map);
-  values.print_on((JavaThread*)nullptr, st);
+  values.print_on(static_cast<JavaThread*>(nullptr), st);
 }
 #endif
 
@@ -2602,7 +2608,7 @@ private:
   template <bool use_compressed>
   static void resolve_gc() {
     BarrierSet* bs = BarrierSet::barrier_set();
-    assert(bs != NULL, "freeze/thaw invoked before BarrierSet is set");
+    assert(bs != nullptr, "freeze/thaw invoked before BarrierSet is set");
     switch (bs->kind()) {
 #define BARRIER_SET_RESOLVE_BARRIER_CLOSURE(bs_name)                    \
       case BarrierSet::bs_name: {                                       \
